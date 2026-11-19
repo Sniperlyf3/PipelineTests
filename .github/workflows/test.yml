@@ -114,17 +114,22 @@ jobs:
           ssh-authorized-keys: ${{ steps.keys.outputs.ssh }}
           allowed-actors: "*"
           wait: "false"
+      # Through the helper's own code path for --identity (tc_ssh).
       - name: Right tunnel key + right SSH key gets in
+        env:
+          ADDR_FILE: ${{ steps.session.outputs.address-file }}
         run: |
-          addr=$(cat "${{ steps.session.outputs.address-file }}")
-          k="$RUNNER_TEMP/keys"
-          out=$(timeout 60 tailcat --key="$k/tc.private.json" ssh -i "$k/good_ssh" "$addr" 'echo in')
+          # shellcheck disable=SC2016 # expanded by the inner bash
+          out=$(timeout 60 bash -c '. bin/tailcat-debug; TC=$(command -v tailcat); ADDR=$(cat "$ADDR_FILE");
+            IDENTITY="$RUNNER_TEMP/keys/good_ssh"; tc_ssh "$RUNNER_TEMP/keys/tc.private.json" "echo in"' </dev/null)
           [[ "$out" == in ]]
       - name: Right tunnel key + wrong SSH key is refused
+        env:
+          ADDR_FILE: ${{ steps.session.outputs.address-file }}
         run: |
-          addr=$(cat "${{ steps.session.outputs.address-file }}")
-          k="$RUNNER_TEMP/keys"
-          if timeout 60 tailcat --key="$k/tc.private.json" ssh -i "$k/bad_ssh" "$addr" true </dev/null; then
+          # shellcheck disable=SC2016 # expanded by the inner bash
+          if timeout 60 bash -c '. bin/tailcat-debug; TC=$(command -v tailcat); ADDR=$(cat "$ADDR_FILE");
+            IDENTITY="$RUNNER_TEMP/keys/bad_ssh"; tc_ssh "$RUNNER_TEMP/keys/tc.private.json" true' </dev/null; then
             echo "::error::wrong SSH key got in"; exit 1
           fi
 
@@ -203,13 +208,40 @@ jobs:
           for ($i = 0; $i -lt 60 -and -not (Test-Path $addrFile); $i++) { Start-Sleep -Milliseconds 500 }
           $State.Addr = (Get-Content -Raw $addrFile).Trim()
 
-          $out = (Invoke-Tailcat @("--key=$key", 'ssh', $State.Addr, 'echo hello-from-tailcat') | Out-String).Trim()
+          $out = (Invoke-Session $key @('echo hello-from-tailcat') | Out-String).Trim()
           Write-Host "remote said: $out"
           if ($out -notmatch 'hello-from-tailcat') { throw "unexpected ssh output: $out" }
+
+          # -Identity path: a second server that also requires an SSH key.
+          # Start-Process passes the command line verbatim: an empty -N "" is
+          # dropped by Windows PowerShell 5.1's native argument passing.
+          foreach ($n in 'good_ssh', 'bad_ssh') {
+            Start-Process ssh-keygen -Wait -NoNewWindow -ArgumentList "-q -t ed25519 -N `"`" -f `"$work\$n`""
+          }
+          if (-not (Test-Path "$work\good_ssh.pub")) { throw 'ssh-keygen failed' }
+          $addrFile2 = Join-Path $env:RUNNER_TEMP 'addr2.txt'
+          $env:TAILCAT_ADDR_FILE = $addrFile2
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'srvcache'
+          $srv2 = Start-Process -FilePath $State.Tc -PassThru -NoNewWindow `
+            -ArgumentList @('--key=new', 'serve', "--allow=$pub", "--ssh-authorized-keys=$work\good_ssh.pub", 'ssh') `
+            -RedirectStandardError (Join-Path $env:RUNNER_TEMP 'srv2.log')
+          $env:LOCALAPPDATA = $savedLocal
+          Remove-Item Env:\TAILCAT_ADDR_FILE
+          for ($i = 0; $i -lt 60 -and -not (Test-Path $addrFile2); $i++) { Start-Sleep -Milliseconds 500 }
+          $State.Addr = (Get-Content -Raw $addrFile2).Trim()
+
+          $Identity = "$work\good_ssh"
+          $out = (Invoke-Session $key @('echo identity-ok') | Out-String).Trim()
+          Write-Host "remote said: $out"
+          if ($out -notmatch 'identity-ok') { throw "-Identity with the right key failed: $out" }
+          $Identity = "$work\bad_ssh"
+          $out = (Invoke-Session $key @('echo should-not-run') -Quiet | Out-String).Trim()
+          if ($out -match 'should-not-run') { throw 'wrong SSH key got in' }
+          $Identity = $null
 
           # No run to end; just clean up like the helper does on exit.
           Stop-DebugSession $key
           if (Test-Path $work) { throw "work folder left behind: $work" }
           if (Test-Path $tcCache) { throw "tailcat wrote to $tcCache" }
-          if (-not $srv.HasExited) { throw 'server (started from the work folder) still running' }
+          if (-not $srv.HasExited -or -not $srv2.HasExited) { throw 'a server (started from the work folder) is still running' }
           Write-Host 'no files left behind'

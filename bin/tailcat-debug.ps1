@@ -130,18 +130,51 @@ function Install-Tailcat {
 # Arguments go in as one array: as loose arguments, PowerShell would try to
 # bind tailcat flags like --client to this function's own parameters.
 function Invoke-Tailcat([string[]]$Arguments, [switch]$Quiet) {
+  Invoke-Cached $State.Tc $Arguments -Quiet:$Quiet
+}
+
+# Run any command (tailcat, or ssh with a tailcat ProxyCommand) with tailcat's
+# cache redirected; child processes inherit it.
+function Invoke-Cached([string]$Exe, [string[]]$Arguments, [switch]$Quiet) {
   $saved = $env:LOCALAPPDATA
   $env:LOCALAPPDATA = Join-Path $State.Work 'cache'
   try {
     if ($Quiet) {
       $ErrorActionPreference = 'Continue'
-      & $State.Tc @Arguments 2>$null
+      & $Exe @Arguments 2>$null
     } else {
-      & $State.Tc @Arguments
+      & $Exe @Arguments
     }
   } finally {
     $env:LOCALAPPDATA = $saved
   }
+}
+
+# SSH to the session, optionally running a remote command. With -Identity we
+# can't use "tailcat ssh -i" (not in released tailcat v0.7.0), so do what
+# "tailcat ssh" does (system ssh + tailcat ProxyCommand) via a throwaway
+# ssh_config in the work folder. A config file sidesteps Windows PowerShell
+# 5.1 mangling quotes in native arguments.
+function Invoke-Session([string]$Key, [string[]]$Remote = @(), [switch]$Quiet) {
+  if (-not $Identity) {
+    Invoke-Tailcat (@("--key=$Key", 'ssh', $State.Addr) + @($Remote)) -Quiet:$Quiet
+    return
+  }
+  $cfg = Join-Path $State.Work 'ssh_config'
+  $id = (Resolve-Path $Identity).Path
+  $lines = @(
+    'Host tailcat-session',
+    '  UpdateHostKeys no',
+    '  StrictHostKeyChecking no',
+    '  UserKnownHostsFile NUL',
+    '  LogLevel ERROR',
+    '  IdentitiesOnly yes',
+    "  IdentityFile `"$id`"",
+    # cmd.exe runs this; New-WorkDir already rejected % ! and " in the path.
+    ("  ProxyCommand `"{0}`" `"--key={1}`" `"{2}`" `"22`"" -f $State.Tc, $Key, $State.Addr)
+  )
+  Set-Content -Path $cfg -Value $lines -Encoding Ascii
+  Invoke-Cached 'ssh' (@('-F', $cfg, '--', 'tailcat-session') + @($Remote)) -Quiet:$Quiet
 }
 
 function New-ClientKey([string]$Path) {
@@ -150,11 +183,6 @@ function New-ClientKey([string]$Path) {
   $pub = ((Invoke-Tailcat @("--key=$Path", 'printpub') -Quiet) | Out-String).Trim()
   if ($pub -notmatch '^nodekey:[0-9a-f]{64}$') { throw "unexpected public key from tailcat: $pub" }
   return $pub
-}
-
-function Get-SshArgs {
-  if ($Identity) { return @('-i', $Identity) }
-  return @()
 }
 
 function Find-DispatchedRun([string]$Sid, [datetime]$Since, [string]$DispatchOut) {
@@ -215,9 +243,8 @@ function Stop-DebugSession([string]$Key) {
     $ended = $false
     if ($State.Addr -and $State.Tc -and (Test-Path $Key)) {
       Write-Info 'Ending debug session; the job will continue'
-      $a = @("--key=$Key", 'ssh') + @(Get-SshArgs) + @($State.Addr, 'touch ~/.tailcat-debug/continue')
       # Not -Quiet: ssh may need to ask for your SSH key's passphrase.
-      Invoke-Tailcat $a | Out-Null
+      Invoke-Session $Key @('touch ~/.tailcat-debug/continue') | Out-Null
       $ended = ($LASTEXITCODE -eq 0)
     }
     if (-not $ended) {
@@ -305,7 +332,7 @@ function Start-DebugSession {
 
     Write-Info "Connecting to runner (run $($State.RunId), $artifact)"
     Write-Note 'Exit the shell when done; the session is ended and temp files are removed.'
-    Invoke-Tailcat (@("--key=$key", 'ssh') + @(Get-SshArgs) + @($State.Addr) + @($Command))
+    Invoke-Session $key $Command
     if ($LASTEXITCODE -eq 255) {
       Write-Warn "ssh failed. If the session requires your GitHub SSH key (debug.yml's default), make sure"
       Write-Warn 'ssh can use one listed at https://github.com/<you>.keys (ssh-agent, or -Identity <key>), or use -NoGitHubSshKey.'

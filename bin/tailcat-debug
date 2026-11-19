@@ -294,11 +294,22 @@ fetch_address() {
   [[ "$ADDR" =~ ^tc[A-Za-z0-9_-]+$ ]] || die "artifact $ARTIFACT doesn't hold a tailcat address"
 }
 
+# Quote for the POSIX shell OpenSSH runs a ProxyCommand with; OpenSSH
+# itself turns %% back into %.
+sq() { local v="${1//%/%%}"; printf "'%s'" "${v//\'/\'\"\'\"\'}"; }
+
 tc_ssh() {
   local key="$1"; shift
-  local -a id=()
-  [[ -n "$IDENTITY" ]] && id=(-i "$IDENTITY")
-  "$TC" --key="$key" ssh ${id[@]+"${id[@]}"} "$ADDR" "$@"
+  if [[ -z "$IDENTITY" ]]; then
+    "$TC" --key="$key" ssh "$ADDR" "$@"
+    return
+  fi
+  # Released tailcat (v0.7.0) has no "ssh -i", so do what "tailcat ssh" does
+  # (system ssh + a tailcat ProxyCommand) and add the identity ourselves.
+  ssh -o "UpdateHostKeys no" -o "StrictHostKeyChecking no" \
+      -o "UserKnownHostsFile /dev/null" -o "LogLevel ERROR" \
+      -o "ProxyCommand=$(sq "$TC") $(sq "--key=$key") $(sq "$ADDR") 22" \
+      -i "$IDENTITY" -o "IdentitiesOnly yes" -- tailcat-session "$@"
 }
 
 ssh_hint() {
@@ -521,4 +532,7 @@ main() {
   esac
 }
 
-main "$@"
+# Sourcing the script (". bin/tailcat-debug") only loads the functions, for tests.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
