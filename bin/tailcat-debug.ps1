@@ -216,7 +216,8 @@ function Stop-DebugSession([string]$Key) {
     if ($State.Addr -and $State.Tc -and (Test-Path $Key)) {
       Write-Info 'Ending debug session; the job will continue'
       $a = @("--key=$Key", 'ssh') + @(Get-SshArgs) + @($State.Addr, 'touch ~/.tailcat-debug/continue')
-      Invoke-Tailcat $a -Quiet | Out-Null
+      # Not -Quiet: ssh may need to ask for your SSH key's passphrase.
+      Invoke-Tailcat $a | Out-Null
       $ended = ($LASTEXITCODE -eq 0)
     }
     if (-not $ended) {
