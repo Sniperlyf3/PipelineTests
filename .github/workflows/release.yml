@@ -1,0 +1,45 @@
+# Push a tag like v1.2.3 to publish a release with the tailcat-debug helper
+# attached, and move the major tag (v1) so `uses: Sniperlyf3/PipelineTests@v1`
+# picks it up.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint
+        run: shellcheck -x bin/tailcat-debug scripts/*.sh
+
+      - name: Build release assets
+        run: |
+          mkdir -p dist
+          sed "s/^TAILCAT_DEBUG_VERSION=\"dev\"$/TAILCAT_DEBUG_VERSION=\"${GITHUB_REF_NAME}\"/" \
+            bin/tailcat-debug > dist/tailcat-debug
+          chmod +x dist/tailcat-debug
+          grep -q "^TAILCAT_DEBUG_VERSION=\"${GITHUB_REF_NAME}\"$" dist/tailcat-debug
+          (cd dist && sha256sum tailcat-debug > SHA256SUMS)
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/tailcat-debug dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" --generate-notes "${prerelease[@]}"
+
+      - name: Move major version tag
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: |
+          major="${GITHUB_REF_NAME%%.*}"
+          git tag -f "$major" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$major"

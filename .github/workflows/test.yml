@@ -1,0 +1,91 @@
+# Lints the scripts and does a real end-to-end session on the runner itself:
+# start the server via the local action, SSH in with the allowed key, and check
+# that a different key is refused.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x bin/tailcat-debug scripts/*.sh
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Portable timeout helper
+        # macOS runners lack GNU coreutils' `timeout`.
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '%s\n' '#!/usr/bin/env perl' 'alarm shift; exec @ARGV or die "exec: $!";' > "$RUNNER_TEMP/bin/to"
+          chmod +x "$RUNNER_TEMP/bin/to"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Install tailcat
+        run: scripts/install-tailcat.sh
+
+      - name: Make client keys
+        id: keys
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          tailcat genkey --client --key="$RUNNER_TEMP/keys/good.private.json" >/dev/null
+          tailcat genkey --client --key="$RUNNER_TEMP/keys/bad.private.json" >/dev/null
+          echo "good=$(tailcat --key="$RUNNER_TEMP/keys/good.private.json" printpub)" >> "$GITHUB_OUTPUT"
+
+      - name: Start session (background)
+        id: session
+        uses: ./
+        with:
+          allow: ${{ steps.keys.outputs.good }}
+          wait: "false"
+
+      - name: Allowed key gets a shell with the job environment
+        run: |
+          addr=$(cat "${{ steps.session.outputs.address-file }}")
+          # shellcheck disable=SC2016 # expanded on the "remote" side
+          out=$(to 60 tailcat --key="$RUNNER_TEMP/keys/good.private.json" ssh "$addr" \
+            '. ~/.tailcat-debug/rc >/dev/null; echo "ok:$GITHUB_REPOSITORY:$(pwd)"')
+          echo "$out"
+          [[ "$out" == "ok:$GITHUB_REPOSITORY:$GITHUB_WORKSPACE" ]]
+
+      - name: Other key is refused
+        run: |
+          addr=$(cat "${{ steps.session.outputs.address-file }}")
+          if to 20 tailcat --key="$RUNNER_TEMP/keys/bad.private.json" ssh "$addr" true; then
+            echo "::error::unauthorized key got in"; exit 1
+          fi
+
+      - name: Address artifact is visible while the run is in progress
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.session.outputs.artifact-name }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+            --jq '.artifacts[].name' | grep -Fx "$NAME"
+
+      - name: tailcat-debug-done ends the wait step
+        run: |
+          addr=$(cat "${{ steps.session.outputs.address-file }}")
+          ( sleep 5; tailcat --key="$RUNNER_TEMP/keys/good.private.json" ssh "$addr" 'touch ~/.tailcat-debug/continue' ) &
+          TC_TIMEOUT_MINUTES=3 to 120 scripts/wait.sh

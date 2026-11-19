@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+# tailcat-debug: start a GitHub Actions debug session and SSH into the runner
+# over tailcat, in one command.
+#
+#   tailcat-debug run [-R owner/repo]      dispatch the debug workflow and connect
+#   tailcat-debug attach <run-id|url>      connect to a session that's already running
+#
+# Requires: gh (logged in), ssh. tailcat is installed automatically if missing.
+# See `tailcat-debug help` or https://github.com/Sniperlyf3/PipelineTests
+set -euo pipefail
+
+TAILCAT_DEBUG_VERSION="dev"
+
+CONFIG_DIR="${TAILCAT_DEBUG_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/tailcat-debug}"
+DATA_DIR="${TAILCAT_DEBUG_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/tailcat-debug}"
+SESSIONS_DIR="$CONFIG_DIR/sessions"
+CLIENT_KEY="$CONFIG_DIR/client.private.json"
+ARTIFACT_PREFIX="tailcat-address"
+DEFAULT_WORKFLOW="${TAILCAT_DEBUG_WORKFLOW:-debug.yml}"
+DEFAULT_KEY_INPUT="${TAILCAT_DEBUG_KEY_INPUT:-tailcat_client_key}"
+TC=""
+
+# ---------------------------------------------------------------- utilities
+
+if [[ -t 2 ]]; then
+  c_dim=$'\e[2m' c_bold=$'\e[1m' c_red=$'\e[31m' c_yellow=$'\e[33m' c_reset=$'\e[0m'
+else
+  c_dim="" c_bold="" c_red="" c_yellow="" c_reset=""
+fi
+info() { printf '%s🐈 %s%s\n' "$c_bold" "$*" "$c_reset" >&2; }
+note() { printf '%s   %s%s\n' "$c_dim" "$*" "$c_reset" >&2; }
+warn() { printf '%swarning:%s %s\n' "$c_yellow" "$c_reset" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$c_red" "$c_reset" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+tailcat-debug ${TAILCAT_DEBUG_VERSION} — SSH into GitHub Actions runners over tailcat
+
+Usage:
+  tailcat-debug run [options] [-- <remote command>]
+      Dispatch the debug workflow with a fresh one-off tailcat key, wait for
+      the runner to come up, and open an SSH session to it.
+
+      -R, --repo OWNER/REPO   repository (default: the current directory's)
+      -w, --workflow FILE     workflow to dispatch (default: ${DEFAULT_WORKFLOW})
+      -r, --ref REF           branch or tag to run on (default: default branch)
+          --runs-on LABEL     runner label, passed as input runs_on
+          --timeout MINUTES   session length, passed as input timeout_minutes
+      -f, --field KEY=VALUE   extra workflow input (repeatable)
+          --key-input NAME    input that receives the client key
+                              (default: ${DEFAULT_KEY_INPUT})
+          --no-session-id     don't pass a session_id input; find the run by
+                              time and user instead
+          --keep              leave the session running after you disconnect
+          --end               end the session after you disconnect (no prompt)
+          --wait-timeout MIN  give up if no session appears (default: 20)
+
+  tailcat-debug attach <run-id|run-url> [options] [-- <remote command>]
+      Connect to a running session (e.g. one started by an on-failure step).
+
+      -R, --repo OWNER/REPO   repository (taken from the URL if given)
+      -j, --job TEXT          pick the session whose artifact name contains TEXT
+          --key FILE          tailcat client key to use (default: the run's
+                              one-off key if this machine started it, else
+                              ${CLIENT_KEY/#$HOME/\~})
+          --keep / --end      as for run
+          --wait-timeout MIN  how long to wait for the session (default: 20)
+
+  tailcat-debug end <run-id|run-url> [-R OWNER/REPO] [-j TEXT] [--key FILE]
+      Let the job continue (same as running tailcat-debug-done in the session).
+
+  tailcat-debug pubkey
+      Print this machine's long-lived client public key (created on first
+      use). Put it in the action's 'allow' input, e.g. via a repo variable,
+      for sessions you didn't start with 'run'.
+
+  tailcat-debug install-tailcat     install the tailcat CLI if it's missing
+  tailcat-debug version
+
+Environment:
+  TAILCAT_DEBUG_WORKFLOW   default for --workflow
+  TAILCAT_DEBUG_KEY_INPUT  default for --key-input
+  TAILCAT                  path to a tailcat binary to use
+EOF
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed${2:+ ($2)}"; }
+
+is_tty() { [[ -t 0 && -t 1 ]]; }
+
+# Parse "<run-id>" or "https://github.com/OWNER/REPO/actions/runs/<id>[/...]".
+# Sets RUN_ID and (from a URL) URL_REPO.
+parse_run_ref() {
+  local ref="$1"
+  URL_REPO=""
+  if [[ "$ref" =~ ^[0-9]+$ ]]; then
+    RUN_ID="$ref"
+  elif [[ "$ref" =~ ^https?://[^/]+/([^/]+/[^/]+)/actions/runs/([0-9]+) ]]; then
+    URL_REPO="${BASH_REMATCH[1]}"
+    RUN_ID="${BASH_REMATCH[2]}"
+  else
+    die "not a run id or run URL: $ref"
+  fi
+}
+
+resolve_repo() {
+  if [[ -n "${REPO:-}" ]]; then return; fi
+  if [[ -n "${URL_REPO:-}" ]]; then REPO="$URL_REPO"; return; fi
+  REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) \
+    || die "can't tell which repository to use; pass -R OWNER/REPO"
+}
+
+session_key_path() { printf '%s/%s-%s.private.json' "$SESSIONS_DIR" "${REPO//\//_}" "$1"; }
+
+# ------------------------------------------------------------ tailcat setup
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+
+install_tailcat() {
+  local os arch ext version url num asset base tmp want got bindir="$DATA_DIR/bin"
+  case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=darwin ;;
+    MINGW*|MSYS*|CYGWIN*) os=windows ;;
+    *) die "unsupported OS $(uname -s); install tailcat yourself: https://github.com/tailscale/tailcat/blob/main/INSTALL.md" ;;
+  esac
+  if [[ "$os" == darwin ]]; then
+    if command -v brew >/dev/null 2>&1; then
+      info "Installing tailcat with Homebrew"
+      brew install tailcat >&2
+      TC=$(command -v tailcat); return
+    fi
+    if command -v go >/dev/null 2>&1; then
+      info "Installing tailcat with go install"
+      mkdir -p "$bindir"
+      GOBIN="$bindir" go install github.com/tailscale/tailcat/cmd/tailcat@latest >&2
+      TC="$bindir/tailcat"; return
+    fi
+    die "install tailcat first: brew install tailcat"
+  fi
+  case "$(uname -m)" in
+    x86_64|amd64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    armv7l) arch=armv7 ;;
+    *) die "unsupported CPU $(uname -m); install tailcat yourself" ;;
+  esac
+  need curl
+  url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/tailscale/tailcat/releases/latest) \
+    || die "can't reach github.com to find the latest tailcat release"
+  version="${url##*/}"
+  [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "unexpected tailcat release tag: $version"
+  num="${version#v}"
+  ext=tar.gz; [[ "$os" == windows ]] && ext=zip
+  asset="tailcat_${num}_${os}_${arch}.${ext}"
+  base="https://github.com/tailscale/tailcat/releases/download/${version}"
+  tmp=$(mktemp -d)
+  info "Installing tailcat ${version} to ${bindir/#$HOME/\~}"
+  curl -fsSL --retry 3 -o "$tmp/$asset" "$base/$asset" || { rm -rf "$tmp"; die "download failed: $base/$asset"; }
+  curl -fsSL --retry 3 -o "$tmp/checksums.txt" "$base/checksums.txt" || { rm -rf "$tmp"; die "download failed: $base/checksums.txt"; }
+  want=$(awk -v a="$asset" '$2 == a {print $1}' "$tmp/checksums.txt")
+  got=$(sha256 "$tmp/$asset")
+  [[ -n "$want" && "$want" == "$got" ]] || { rm -rf "$tmp"; die "checksum mismatch for $asset"; }
+  mkdir -p "$bindir"
+  if [[ "$ext" == zip ]]; then
+    need unzip
+    unzip -q -o "$tmp/$asset" -d "$tmp/x"
+    cp "$tmp/x/tailcat.exe" "$bindir/tailcat.exe"
+    TC="$bindir/tailcat.exe"
+  else
+    tar -xzf "$tmp/$asset" -C "$tmp" tailcat
+    install -m 0755 "$tmp/tailcat" "$bindir/tailcat"
+    TC="$bindir/tailcat"
+  fi
+  rm -rf "$tmp"
+}
+
+ensure_tailcat() {
+  if [[ -n "${TAILCAT:-}" ]]; then TC="$TAILCAT"; return; fi
+  if command -v tailcat >/dev/null 2>&1; then TC=$(command -v tailcat); return; fi
+  for f in "$DATA_DIR/bin/tailcat" "$DATA_DIR/bin/tailcat.exe"; do
+    [[ -x "$f" ]] && { TC="$f"; return; }
+  done
+  if is_tty; then
+    local ans
+    read -r -p "tailcat isn't installed. Install it now? [Y/n] " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy] ]] || die "tailcat is required: https://github.com/tailscale/tailcat/blob/main/INSTALL.md"
+  fi
+  install_tailcat
+}
+
+ensure_deps() {
+  need gh "https://cli.github.com"
+  need ssh
+  gh auth status >/dev/null 2>&1 || die "gh isn't logged in; run: gh auth login"
+  ensure_tailcat
+}
+
+# Generate a client key at $1 and print its public key.
+new_client_key() {
+  mkdir -p "$(dirname "$1")"
+  chmod 700 "$CONFIG_DIR" "$(dirname "$1")" 2>/dev/null || true
+  "$TC" genkey --client --force --key="$1" >/dev/null 2>&1 || die "tailcat genkey failed"
+  chmod 600 "$1" 2>/dev/null || true
+  pubkey_of "$1"
+}
+
+pubkey_of() {
+  local pub
+  pub=$("$TC" --key="$1" printpub 2>/dev/null) || die "can't read tailcat key $1"
+  [[ "$pub" =~ ^nodekey:[0-9a-f]{64}$ ]] || die "unexpected public key from tailcat: $pub"
+  printf '%s\n' "$pub"
+}
+
+# ------------------------------------------------------------- run helpers
+
+# Find the run created by our dispatch. Uses the session id embedded in the
+# run name, else the newest workflow_dispatch run by us since $since.
+find_dispatched_run() {
+  local workflow="$1" sid="$2" since="$3" dispatch_out="$4" me filter id
+  if [[ "$dispatch_out" =~ /actions/runs/([0-9]+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"; return
+  fi
+  me=$(gh api user -q .login)
+  if [[ -n "$sid" ]]; then
+    filter="[.[] | select(.displayTitle | contains(\"$sid\"))][0].databaseId // empty"
+  else
+    filter="[.[] | select(.createdAt >= \"$since\")] | sort_by(.createdAt) | .[0].databaseId // empty"
+  fi
+  for _ in $(seq 1 30); do
+    id=$(gh run list -R "$REPO" --workflow "$workflow" --event workflow_dispatch --user "$me" \
+          -L 20 --json databaseId,displayTitle,createdAt -q "$filter" 2>/dev/null || true)
+    if [[ -n "$id" ]]; then printf '%s\n' "$id"; return; fi
+    sleep 2
+  done
+  return 1
+}
+
+# Wait until the run has published a tailcat address artifact; sets ARTIFACT.
+wait_for_session() {
+  local run="$1" job_filter="${2:-}" wait_min="${3:-20}" deadline status last="" names
+  deadline=$(( $(date +%s) + wait_min * 60 ))
+  while :; do
+    names=$(gh api "repos/$REPO/actions/runs/$run/artifacts?per_page=100" \
+      -q ".artifacts[] | select(.expired | not) | select(.name | startswith(\"$ARTIFACT_PREFIX\")) | .name" 2>/dev/null || true)
+    if [[ -n "$job_filter" && -n "$names" ]]; then
+      names=$(grep -F -- "$job_filter" <<< "$names" || true)
+    fi
+    if [[ -n "$names" ]]; then
+      pick_artifact "$names"; return
+    fi
+    status=$(gh run view "$run" -R "$REPO" --json status,conclusion -q '.status + (if .conclusion != "" then " (" + .conclusion + ")" else "" end)' 2>/dev/null || echo "unknown")
+    if [[ "$status" == completed* ]]; then
+      die "run finished without a debug session: $status. Logs: gh run view $run -R $REPO --log-failed"
+    fi
+    if [[ "$status" != "$last" ]]; then note "run status: $status"; last="$status"; fi
+    (( $(date +%s) < deadline )) || die "no debug session after ${wait_min} minutes (run status: $status)"
+    sleep 4
+  done
+}
+
+pick_artifact() {
+  local -a list=()
+  local line
+  while IFS= read -r line; do [[ -n "$line" ]] && list+=("$line"); done <<< "$1"
+  if (( ${#list[@]} == 1 )); then ARTIFACT="${list[0]}"; return; fi
+  if is_tty; then
+    info "This run has ${#list[@]} debug sessions:"
+    local PS3="Connect to which one? "
+    select ARTIFACT in "${list[@]}"; do [[ -n "${ARTIFACT:-}" ]] && break; done
+  else
+    ARTIFACT="${list[0]}"
+    warn "run has ${#list[@]} sessions; using $ARTIFACT (pick one with --job)"
+  fi
+}
+
+# Download the address artifact; sets ADDR.
+fetch_address() {
+  local run="$1" tmp f
+  tmp=$(mktemp -d)
+  gh run download "$run" -R "$REPO" -n "$ARTIFACT" -D "$tmp" >/dev/null \
+    || { rm -rf "$tmp"; die "couldn't download artifact $ARTIFACT"; }
+  f=$(find "$tmp" -type f | head -n 1)
+  ADDR=$(tr -d '[:space:]' < "$f")
+  rm -rf "$tmp"
+  [[ "$ADDR" =~ ^tc[A-Za-z0-9_-]+$ ]] || die "artifact $ARTIFACT doesn't hold a tailcat address"
+}
+
+end_session() {
+  local key="$1"
+  info "Ending debug session; the job will continue"
+  # shellcheck disable=SC2016 # $HOME expands on the runner
+  if "$TC" --key="$key" ssh "$ADDR" 'touch "$HOME/.tailcat-debug/continue"' </dev/null; then
+    return 0
+  fi
+  warn "couldn't reach the session to end it; it ends at its timeout, or: gh run cancel $RUN_ID -R $REPO"
+  return 1
+}
+
+# Connect, then end or keep the session as asked.
+connect() {
+  local key="$1" after="$2"; shift 2
+  info "Connecting to runner (run $RUN_ID, $ARTIFACT)"
+  note "In the session: tailcat-debug-done to let the job continue, tailcat-debug-fail to fail it."
+  local rc=0
+  "$TC" --key="$key" ssh "$ADDR" "$@" || rc=$?
+  if [[ "$after" == ask ]]; then
+    if is_tty && (( $# == 0 )); then
+      local ans
+      read -r -p "End the debug session and let the job continue? [Y/n] " ans
+      if [[ -z "$ans" || "$ans" =~ ^[Yy] ]]; then after=end; else after=keep; fi
+    else
+      after=keep
+    fi
+  fi
+  if [[ "$after" == end ]]; then
+    end_session "$key" && cleanup_session_key
+  else
+    info "Session left running. Reconnect with:"
+    printf '  tailcat-debug attach %s -R %s\n' "$RUN_ID" "$REPO" >&2
+  fi
+  return "$rc"
+}
+
+cleanup_session_key() {
+  local f
+  f=$(session_key_path "$RUN_ID")
+  [[ -f "$f" ]] && rm -f "$f"
+  return 0
+}
+
+# ----------------------------------------------------------------- commands
+
+cmd_run() {
+  local workflow="$DEFAULT_WORKFLOW" ref="" key_input="$DEFAULT_KEY_INPUT" use_sid=1 after=ask wait_min=20
+  local -a fields=()
+  REPO=""
+  while (( $# )); do
+    case "$1" in
+      -R|--repo) REPO="${2:?}"; shift 2 ;;
+      -w|--workflow) workflow="${2:?}"; shift 2 ;;
+      -r|--ref) ref="${2:?}"; shift 2 ;;
+      --runs-on) fields+=(-f "runs_on=${2:?}"); shift 2 ;;
+      --timeout) fields+=(-f "timeout_minutes=${2:?}"); shift 2 ;;
+      -f|--field) fields+=(-f "${2:?}"); shift 2 ;;
+      --key-input) key_input="${2:?}"; shift 2 ;;
+      --no-session-id) use_sid=0; shift ;;
+      --keep) after=keep; shift ;;
+      --end) after=end; shift ;;
+      --wait-timeout) wait_min="${2:?}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; break ;;
+      *) die "unknown option for run: $1 (see tailcat-debug help)" ;;
+    esac
+  done
+  ensure_deps
+  resolve_repo
+
+  # A one-off client key just for this session: the runner only accepts
+  # WireGuard handshakes from it, so the published address alone is useless.
+  local sid="" pending pub since out
+  sid=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
+  pending="$SESSIONS_DIR/pending-$sid.private.json"
+  pub=$(new_client_key "$pending")
+  # shellcheck disable=SC2064 # expand now: $pending is local
+  trap "rm -f $(printf %q "$pending")" EXIT
+
+  local -a args=(workflow run "$workflow" -R "$REPO" -f "$key_input=$pub")
+  [[ -n "$ref" ]] && args+=(--ref "$ref")
+  (( use_sid )) && args+=(-f "session_id=$sid")
+  args+=(${fields[@]+"${fields[@]}"})  # bash 3.2 (macOS) + set -u safe
+
+  since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  info "Dispatching $workflow on $REPO${ref:+ @ $ref}"
+  out=$(gh "${args[@]}" 2>&1) || die "gh workflow run failed: $out"
+  local sid_arg=""
+  (( use_sid )) && sid_arg="$sid"
+  RUN_ID=$(find_dispatched_run "$workflow" "$sid_arg" "$since" "$out") \
+    || die "dispatched, but couldn't find the run; once it's up use: tailcat-debug attach <run-id> -R $REPO --key $pending"
+
+  local key
+  key=$(session_key_path "$RUN_ID")
+  mv "$pending" "$key"
+  trap - EXIT
+  note "run: https://github.com/$REPO/actions/runs/$RUN_ID"
+  info "Waiting for the runner to start the session…"
+  wait_for_session "$RUN_ID" "" "$wait_min"
+  fetch_address "$RUN_ID"
+  connect "$key" "$after" "$@"
+}
+
+cmd_attach() {
+  local key="" job="" after=ask wait_min=20 ref=""
+  REPO=""
+  while (( $# )); do
+    case "$1" in
+      -R|--repo) REPO="${2:?}"; shift 2 ;;
+      -j|--job) job="${2:?}"; shift 2 ;;
+      --key) key="${2:?}"; shift 2 ;;
+      --keep) after=keep; shift ;;
+      --end) after=end; shift ;;
+      --wait-timeout) wait_min="${2:?}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option for attach: $1" ;;
+      *) [[ -z "$ref" ]] || die "unexpected argument: $1"; ref="$1"; shift ;;
+    esac
+  done
+  [[ -n "$ref" ]] || die "attach needs a run id or run URL"
+  parse_run_ref "$ref"
+  ensure_deps
+  resolve_repo
+  key=$(choose_key "$key")
+  wait_for_session "$RUN_ID" "$job" "$wait_min"
+  fetch_address "$RUN_ID"
+  connect "$key" "$after" "$@"
+}
+
+cmd_end() {
+  local key="" job="" ref=""
+  REPO=""
+  while (( $# )); do
+    case "$1" in
+      -R|--repo) REPO="${2:?}"; shift 2 ;;
+      -j|--job) job="${2:?}"; shift 2 ;;
+      --key) key="${2:?}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option for end: $1" ;;
+      *) [[ -z "$ref" ]] || die "unexpected argument: $1"; ref="$1"; shift ;;
+    esac
+  done
+  [[ -n "$ref" ]] || die "end needs a run id or run URL"
+  parse_run_ref "$ref"
+  ensure_deps
+  resolve_repo
+  key=$(choose_key "$key")
+  wait_for_session "$RUN_ID" "$job" 1
+  fetch_address "$RUN_ID"
+  end_session "$key" && cleanup_session_key
+}
+
+# --key flag > this machine's one-off key for the run > long-lived client key.
+choose_key() {
+  local explicit="$1" one_off
+  if [[ -n "$explicit" ]]; then
+    [[ -f "$explicit" ]] || die "no such key file: $explicit"
+    printf '%s\n' "$explicit"; return
+  fi
+  one_off=$(session_key_path "$RUN_ID")
+  if [[ -f "$one_off" ]]; then printf '%s\n' "$one_off"; return; fi
+  if [[ ! -f "$CLIENT_KEY" ]]; then
+    die "no key for run $RUN_ID on this machine. If the job's 'allow' input has your long-lived key, create it with: tailcat-debug pubkey"
+  fi
+  printf '%s\n' "$CLIENT_KEY"
+}
+
+cmd_pubkey() {
+  ensure_tailcat
+  if [[ ! -f "$CLIENT_KEY" ]]; then
+    new_client_key "$CLIENT_KEY"
+    note "created ${CLIENT_KEY/#$HOME/\~}"
+  else
+    pubkey_of "$CLIENT_KEY"
+  fi
+}
+
+main() {
+  local cmd="${1:-help}"
+  (( $# )) && shift
+  case "$cmd" in
+    run) cmd_run "$@" ;;
+    attach|connect|ssh) cmd_attach "$@" ;;
+    end|done) cmd_end "$@" ;;
+    pubkey) cmd_pubkey ;;
+    install-tailcat) ensure_tailcat; printf '%s\n' "$TC" ;;
+    version|--version|-V) printf 'tailcat-debug %s\n' "$TAILCAT_DEBUG_VERSION" ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command: $cmd (see tailcat-debug help)" ;;
+  esac
+}
+
+main "$@"

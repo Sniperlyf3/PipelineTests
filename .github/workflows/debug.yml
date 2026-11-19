@@ -1,0 +1,85 @@
+# Start a debug session on a fresh runner and SSH into it with:
+#
+#   tailcat-debug run -R <owner>/<repo>
+#
+# Can also be called from other repos as a reusable workflow:
+#
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         tailcat_client_key: { required: true, type: string }
+#         session_id: { required: false, type: string, default: "" }
+#   jobs:
+#     debug:
+#       uses: Sniperlyf3/PipelineTests/.github/workflows/debug.yml@main
+#       with:
+#         tailcat_client_key: ${{ inputs.tailcat_client_key }}
+#         session_id: ${{ inputs.session_id }}
+name: tailcat debug
+
+run-name: "tailcat debug session ${{ inputs.session_id }} on ${{ inputs.runs_on || 'ubuntu-latest' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tailcat_client_key:
+        description: tailcat client public key (nodekey:...) allowed to connect
+        required: true
+        type: string
+      session_id:
+        description: Set by tailcat-debug to find this run; leave empty when starting by hand
+        required: false
+        type: string
+        default: ""
+      runs_on:
+        description: Runner label to debug on
+        required: false
+        type: string
+        default: ubuntu-latest
+      timeout_minutes:
+        description: How long to keep the session open
+        required: false
+        type: string
+        default: "30"
+      checkout:
+        description: Check out the repository first
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      tailcat_client_key:
+        required: true
+        type: string
+      session_id:
+        required: false
+        type: string
+        default: ""
+      runs_on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      timeout_minutes:
+        required: false
+        type: string
+        default: "30"
+      checkout:
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        if: inputs.checkout
+
+      - uses: Sniperlyf3/PipelineTests@main
+        with:
+          allow: ${{ inputs.tailcat_client_key }}
+          timeout-minutes: ${{ inputs.timeout_minutes || '30' }}

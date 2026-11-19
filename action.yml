@@ -1,0 +1,96 @@
+name: tailcat debug session
+description: >
+  Open an SSH session into the running GitHub Actions runner over tailcat
+  (Tailscale's WireGuard data plane, no Tailscale account needed), so you can
+  debug the job interactively.
+author: Sniperlyf3
+branding:
+  icon: terminal
+  color: purple
+
+inputs:
+  allow:
+    description: >
+      Comma-separated tailcat client public keys (nodekey:...) allowed to connect.
+      The tailcat-debug helper creates a one-off key per session and passes it in;
+      for long-lived keys print yours with `tailcat-debug pubkey`.
+    required: false
+    default: ""
+  ssh-authorized-keys:
+    description: >
+      Optional extra SSH-layer auth: --ssh-authorized-keys sources, e.g.
+      "${{ github.actor }}@github" or a literal "ssh-ed25519 AAAA..." line.
+      When set, the server requires one of these SSH keys too.
+    required: false
+    default: ""
+  insecure-no-auth:
+    description: >
+      Allow starting the server with neither 'allow' nor 'ssh-authorized-keys'.
+      The address is published as an artifact, so anyone who can read the
+      repo's artifacts gets a shell. Don't.
+    required: false
+    default: "false"
+  wait:
+    description: >
+      "true" (default): block this step until you run `tailcat-debug-done` in the
+      session, the timeout passes, or the server exits.
+      "false": start the server in the background and continue the job; it stays
+      reachable until the job ends.
+    required: false
+    default: "true"
+  timeout-minutes:
+    description: How long to keep the session open when wait is true.
+    required: false
+    default: "30"
+  artifact-name:
+    description: >
+      Name of the artifact that carries the tailcat address. Must start with
+      "tailcat-address" for `tailcat-debug attach` to find it. Default: unique per job.
+    required: false
+    default: ""
+  tailcat-version:
+    description: tailcat release tag to install (e.g. v0.7.0), or "latest".
+    required: false
+    default: latest
+
+outputs:
+  artifact-name:
+    description: Name of the uploaded address artifact.
+    value: ${{ steps.start.outputs.artifact-name }}
+  address-file:
+    description: Path on the runner of the file holding the tailcat address.
+    value: ${{ steps.start.outputs.address-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install tailcat
+      shell: bash
+      env:
+        TAILCAT_VERSION: ${{ inputs.tailcat-version }}
+      run: '"$GITHUB_ACTION_PATH/scripts/install-tailcat.sh"'
+
+    - name: Start tailcat SSH server
+      id: start
+      shell: bash
+      env:
+        TC_ALLOW: ${{ inputs.allow }}
+        TC_SSH_KEYS: ${{ inputs.ssh-authorized-keys }}
+        TC_INSECURE: ${{ inputs.insecure-no-auth }}
+        TC_ARTIFACT_NAME: ${{ inputs.artifact-name }}
+      run: '"$GITHUB_ACTION_PATH/scripts/start-server.sh"'
+
+    - name: Publish tailcat address
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.start.outputs.artifact-name }}
+        path: ${{ steps.start.outputs.address-file }}
+        retention-days: 1
+        if-no-files-found: error
+
+    - name: Wait for debug session to end
+      if: inputs.wait == 'true'
+      shell: bash
+      env:
+        TC_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+      run: '"$GITHUB_ACTION_PATH/scripts/wait.sh"'
