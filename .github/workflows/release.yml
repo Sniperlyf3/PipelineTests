@@ -1,11 +1,20 @@
-# Push a tag like v1.2.3 to publish a release with the tailcat-debug helper
-# attached, and move the major tag (v1) so `uses: Sniperlyf3/PipelineTests@v1`
-# picks it up.
+# Publish a release with the tailcat-debug helpers attached, and move the
+# major tag (v1) so `uses: Sniperlyf3/PipelineTests@v1` picks it up.
+#
+# Either push a tag like v1.2.3, or run this workflow by hand (Actions tab, or
+# `gh workflow run release.yml -f version=v1.2.3`) and it creates the tag on
+# the commit it runs on.
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, e.g. v1.2.3 (tag is created on the selected branch's commit)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -13,8 +22,15 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check version
+        run: |
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
+            || { echo "::error::version must look like v1.2.3 (got '$VERSION')"; exit 1; }
 
       - name: Lint
         run: shellcheck -x bin/tailcat-debug scripts/*.sh
@@ -22,13 +38,13 @@ jobs:
       - name: Build release assets
         run: |
           mkdir -p dist
-          sed "s/^TAILCAT_DEBUG_VERSION=\"dev\"$/TAILCAT_DEBUG_VERSION=\"${GITHUB_REF_NAME}\"/" \
+          sed "s/^TAILCAT_DEBUG_VERSION=\"dev\"$/TAILCAT_DEBUG_VERSION=\"${VERSION}\"/" \
             bin/tailcat-debug > dist/tailcat-debug
           chmod +x dist/tailcat-debug
-          grep -q "^TAILCAT_DEBUG_VERSION=\"${GITHUB_REF_NAME}\"$" dist/tailcat-debug
-          sed "s/^\$TailcatDebugVersion = 'dev'$/\$TailcatDebugVersion = '${GITHUB_REF_NAME}'/" \
+          grep -q "^TAILCAT_DEBUG_VERSION=\"${VERSION}\"$" dist/tailcat-debug
+          sed "s/^\$TailcatDebugVersion = 'dev'$/\$TailcatDebugVersion = '${VERSION}'/" \
             bin/tailcat-debug.ps1 > dist/tailcat-debug.ps1
-          grep -q "^\$TailcatDebugVersion = '${GITHUB_REF_NAME}'$" dist/tailcat-debug.ps1
+          grep -q "^\$TailcatDebugVersion = '${VERSION}'$" dist/tailcat-debug.ps1
           (cd dist && sha256sum tailcat-debug tailcat-debug.ps1 > SHA256SUMS)
 
       - name: Create release
@@ -36,13 +52,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           prerelease=()
-          [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease=(--prerelease)
-          gh release create "$GITHUB_REF_NAME" dist/tailcat-debug dist/tailcat-debug.ps1 dist/SHA256SUMS \
-            --title "$GITHUB_REF_NAME" --generate-notes "${prerelease[@]}"
+          [[ "$VERSION" == *-* ]] && prerelease=(--prerelease)
+          # --target creates the tag at this commit if it doesn't exist yet.
+          gh release create "$VERSION" dist/tailcat-debug dist/tailcat-debug.ps1 dist/SHA256SUMS \
+            --target "$GITHUB_SHA" --title "$VERSION" --generate-notes "${prerelease[@]}"
 
       - name: Move major version tag
-        if: ${{ !contains(github.ref_name, '-') }}
+        if: ${{ !contains(env.VERSION, '-') }}
         run: |
-          major="${GITHUB_REF_NAME%%.*}"
+          major="${VERSION%%.*}"
           git tag -f "$major" "$GITHUB_SHA"
           git push -f origin "refs/tags/$major"
