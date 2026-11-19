@@ -74,6 +74,77 @@ Things to keep in mind:
   contributors" (or at least first-time contributors) for fork pull requests. That's
   good practice for any public repo with Actions.
 
+## Connect with only tailcat (no gh, no helper)
+
+If you'd rather not install `gh` or the helper, give the runner a **fixed address
+that you already know**. You set this up once. Afterwards you start a session from
+the Actions tab and connect with plain `tailcat ssh`.
+
+**1. Once, on your machine, make two tailcat keys:**
+
+```bash
+tailcat genkey --client --key=client-default
+```
+
+This prints `nodekey:…`, the public half of your client identity. `tailcat ssh` uses
+the `client-default` key automatically.
+
+```bash
+tailcat genkey --key=pipeline-runner --fixed-region
+```
+
+This prints the runner's address (`tc…`). **Save it**: it's what you'll connect to.
+The key is written to `keys\pipeline-runner.private.json` in tailcat's config folder:
+
+| OS | Folder |
+|---|---|
+| Windows | `%AppData%\tailcat\` |
+| Linux | `~/.config/tailcat/` |
+| macOS | `~/Library/Application Support/tailcat/` |
+
+**2. Put them in the repo.** Go to Settings → Secrets and variables → Actions.
+
+- **Secrets** tab → New repository secret: name `TAILCAT_SERVER_KEY`, value the
+  *whole contents* of `pipeline-runner.private.json`.
+- **Variables** tab → New repository variable: name `TAILCAT_ALLOW`, value the
+  `nodekey:…` line from the first command.
+
+Then delete the server key from your machine. You only need its address, and from now
+on GitHub holds the only copy:
+
+```bash
+tailcat genkey --delete --key=pipeline-runner
+```
+
+**3. Start a session:** Actions → **tailcat debug** → **Run workflow**. Leave
+`tailcat_client_key` empty so it uses `TAILCAT_ALLOW`. Untick `github_ssh_key` if your
+GitHub account has no SSH key.
+
+**4. Connect** once the job reaches "Wait for debug session to end" (about 20–30s):
+
+```bash
+tailcat ssh tcYOUR_SAVED_ADDRESS
+```
+
+Run `tailcat-debug-done` inside the session to let the job continue. If you do
+nothing, it ends at the timeout (30 min by default).
+
+Notes:
+- **Who can do what:** starting a session needs you signed in on github.com (only you
+  can run workflows). Connecting needs only tailcat and your `client-default` key, plus
+  one of your GitHub SSH keys if `github_ssh_key` is on. The address alone gets nobody
+  in: the runner still only accepts your client key.
+- **Secret safety:** the server key lives only in a GitHub secret. Secrets are masked in
+  logs, aren't given to workflows from forks, and the runner deletes its copy from disk
+  as soon as tailcat has loaded it.
+- **One session at a time** uses this address. Start a new one after the previous run
+  has finished.
+- **The `run`/`attach` helpers** keep working with this set up. They just connect to
+  the fixed address.
+- **Your own pipelines:** use the same values in their action step:
+  `server-key: ${{ secrets.TAILCAT_SERVER_KEY }}` and `allow: ${{ vars.TAILCAT_ALLOW }}`.
+- **To rotate**, generate a new server key, update the secret, and use the new address.
+
 ## Install the helper
 
 Download it from [Releases](https://github.com/Sniperlyf3/PipelineTests/releases/latest):
@@ -215,6 +286,7 @@ can pick with `--job <text>`.
 |---|---|---|
 | `allow` | | Comma-separated client public keys (`nodekey:…`) allowed to connect. |
 | `ssh-authorized-keys` | | Optional second factor at the SSH layer, e.g. `${{ github.actor }}@github` (fetches the actor's GitHub SSH keys). If set, the session uses tailcat's `ssh` service instead of `no-auth-ssh`. |
+| `server-key` | | A tailcat server private key (JSON from `tailcat genkey`), from a secret. Gives the session a fixed address you already know (see [Connect with only tailcat](#connect-with-only-tailcat-no-gh-no-helper)). Default: a fresh address each run. |
 | `allowed-actors` | repo owner | GitHub users allowed to start a session (actor and re-run triggerer must both be listed). Empty means the repo owner. `*` means anyone who can run the job. |
 | `insecure-no-auth` | `false` | Start even with neither of the above. Then anyone who can read the repo's artifacts gets a shell. |
 | `wait` | `true` | Block until `tailcat-debug-done`, the timeout, or server exit. With `false` the server runs in the background for the rest of the job. |

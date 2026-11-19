@@ -23,6 +23,15 @@ inputs:
       When set, the server requires one of these SSH keys too.
     required: false
     default: ""
+  server-key:
+    description: >
+      Optional: a tailcat server private key (the JSON from `tailcat genkey`),
+      passed from a secret. The session then always has the same address, which
+      you already know, so you connect with just `tailcat ssh <address>`: no gh,
+      no artifact download. Without it, each run gets a fresh address.
+      Run one fixed-address session at a time.
+    required: false
+    default: ""
   allowed-actors:
     description: >
       Comma-separated GitHub usernames allowed to start a session. Both the
@@ -87,6 +96,7 @@ runs:
         TC_ALLOWED_ACTORS: ${{ inputs.allowed-actors }}
         TC_INSECURE: ${{ inputs.insecure-no-auth }}
         TC_ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        TC_SERVER_KEY: ${{ inputs.server-key }}
       run: '"$GITHUB_ACTION_PATH/scripts/start-server.sh"'
 
     - name: Publish tailcat address

@@ -245,3 +245,39 @@ jobs:
           if (Test-Path $tcCache) { throw "tailcat wrote to $tcCache" }
           if (-not $srv.HasExited -or -not $srv2.HasExited) { throw 'a server (started from the work folder) is still running' }
           Write-Host 'no files left behind'
+          exit 0   # the refused wrong-key ssh above left $LASTEXITCODE non-zero
+
+  # Fixed address from a server-key secret: connect with plain `tailcat ssh`.
+  e2e-server-key:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/install-tailcat.sh
+      - name: Make keys (what you'd do once on your machine)
+        id: keys
+        run: |
+          k="$RUNNER_TEMP/keys"; mkdir -p "$k"
+          tailcat genkey --client --key="$k/client.private.json" >/dev/null
+          addr=$(tailcat genkey --key="$k/server.private.json" --fixed-region 2>/dev/null)
+          [[ "$addr" == tc* ]]
+          {
+            echo "addr=$addr"
+            echo "client=$(tailcat --key="$k/client.private.json" printpub)"
+            echo 'server<<EOF_KEY'; cat "$k/server.private.json"; echo; echo 'EOF_KEY'
+          } >> "$GITHUB_OUTPUT"
+      - id: session
+        uses: ./
+        with:
+          allow: ${{ steps.keys.outputs.client }}
+          server-key: ${{ steps.keys.outputs.server }}
+          allowed-actors: "*"
+          wait: "false"
+      - name: The address known in advance works; the key file is gone
+        env:
+          ADDR: ${{ steps.keys.outputs.addr }}
+        run: |
+          out=$(timeout 60 tailcat --key="$RUNNER_TEMP/keys/client.private.json" ssh "$ADDR" 'echo fixed-ok' </dev/null)
+          [[ "$out" == fixed-ok ]]
+          [[ ! -e "$HOME/.tailcat-debug/server.private.json" ]]
+          ! grep -rqF '"Private"' "$HOME/.tailcat-debug"

@@ -23,9 +23,10 @@ on:
   workflow_dispatch:
     inputs:
       tailcat_client_key:
-        description: tailcat client public key (nodekey:...) allowed to connect
-        required: true
+        description: tailcat client public key (nodekey:...) allowed to connect. Empty = the TAILCAT_ALLOW repo variable
+        required: false
         type: string
+        default: ""
       session_id:
         description: Set by tailcat-debug to find this run; leave empty when starting by hand
         required: false
@@ -52,10 +53,14 @@ on:
         type: boolean
         default: true
   workflow_call:
+    secrets:
+      TAILCAT_SERVER_KEY:
+        required: false
     inputs:
       tailcat_client_key:
-        required: true
+        required: false
         type: string
+        default: ""
       session_id:
         required: false
         type: string
@@ -90,7 +95,9 @@ jobs:
 
       - uses: Sniperlyf3/PipelineTests@main
         with:
-          allow: ${{ inputs.tailcat_client_key }}
+          allow: ${{ inputs.tailcat_client_key || vars.TAILCAT_ALLOW }}
+          # Fixed, known address if the repo has this secret (see README).
+          server-key: ${{ secrets.TAILCAT_SERVER_KEY }}
           # Second factor: the SSH layer also wants a key from github.com/<you>.keys.
           ssh-authorized-keys: ${{ inputs.github_ssh_key && format('{0}@github', github.actor) || '' }}
           allowed-actors: ${{ github.repository_owner }}

@@ -8,6 +8,8 @@
 #   TC_ALLOWED_ACTORS comma-separated GitHub users allowed to start a session ("*" = anyone)
 #   TC_INSECURE       "true" to allow an unauthenticated server (address == credential)
 #   TC_ARTIFACT_NAME  artifact name to publish the address under (optional)
+#   TC_SERVER_KEY     optional server private key JSON (from tailcat genkey) for a
+#                     fixed address you already know; otherwise a fresh one per run
 set -euo pipefail
 
 state="${TC_STATE_DIR:-$HOME/.tailcat-debug}"
@@ -20,7 +22,7 @@ lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 # Who may open a session at all. Checked against both the run's actor and the
 # user who triggered this attempt (a re-run), case-insensitively.
 # Empty (e.g. an unset repo variable) means the repo owner, never "anyone".
-actors="${TC_ALLOWED_ACTORS//[[:space:]]/}"
+actors="${TC_ALLOWED_ACTORS:-}"; actors="${actors//[[:space:]]/}"
 actors="$(lower "${actors:-${GITHUB_REPOSITORY_OWNER:-}}")"
 [[ -n "$actors" ]] || { echo "::error::allowed-actors is empty and the repository owner is unknown"; exit 1; }
 if [[ "$actors" != "*" ]]; then
@@ -98,7 +100,17 @@ for f in "${hooked[@]}"; do
 done
 printf '%s\n' "${hooked[@]}" > "$state/hooked-files"
 
-args=(--key=new serve --full-address)
+# Server key: a fixed one from a secret (address known in advance, so you can
+# connect with plain `tailcat ssh <address>`), or a fresh ephemeral one.
+key_arg=--key=new
+key_file=""
+if [[ -n "${TC_SERVER_KEY:-}" ]]; then
+  key_file="$state/server.private.json"
+  ( umask 077; printf '%s' "$TC_SERVER_KEY" > "$key_file" )
+  key_arg="--key=$key_file"
+fi
+
+args=("$key_arg" serve --full-address)
 [[ -n "$allow" ]] && args+=("--allow=$allow")
 if [[ -n "$ssh_keys" ]]; then
   args+=("--ssh-authorized-keys=$ssh_keys" ssh)
@@ -111,6 +123,7 @@ echo "Starting: tailcat ${args[*]}"
 TAILCAT_ADDR_FILE="$state/address" nohup tailcat "${args[@]}" > "$state/server.log" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$state/pid"
+[[ -n "$key_file" ]] && trap 'rm -f "$key_file"' EXIT
 
 for _ in $(seq 1 120); do
   [[ -s "$state/address" ]] && break
@@ -122,6 +135,8 @@ for _ in $(seq 1 120); do
   sleep 0.5
 done
 [[ -s "$state/address" ]] || { echo "::error::timed out waiting for tailcat address"; cat "$state/server.log"; exit 1; }
+# tailcat has read the key by now; don't leave the private key on disk.
+[[ -n "$key_file" ]] && rm -f "$key_file"
 
 addr=$(tr -d '[:space:]' < "$state/address")
 name="${TC_ARTIFACT_NAME:-}"
@@ -146,7 +161,12 @@ if [[ -n "$allow" || -n "$ssh_keys" ]]; then
   # Access is enforced by key, so the address itself is not the credential.
   # The address isn't the credential, but there's no need to put it in
   # (possibly public) logs either; it's only in the artifact.
-  echo "::notice title=tailcat debug session::Connect with: tailcat-debug attach ${GITHUB_RUN_ID:-<run-id>} -R ${GITHUB_REPOSITORY:-<repo>}"
+  if [[ -n "$key_file" ]]; then
+    connect_cmd="tailcat ssh <your saved address>"
+  else
+    connect_cmd="tailcat-debug attach ${GITHUB_RUN_ID:-<run-id>} -R ${GITHUB_REPOSITORY:-<repo>}"
+  fi
+  echo "::notice title=tailcat debug session::Connect with: $connect_cmd"
 else
   echo "::warning title=tailcat debug session::Running WITHOUT authentication; the address artifact '$name' is the only credential."
 fi
@@ -158,7 +178,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
 Connect from your machine:
 
 \`\`\`bash
-tailcat-debug attach ${GITHUB_RUN_ID:-} -R ${GITHUB_REPOSITORY:-}
+${connect_cmd:-tailcat-debug attach ${GITHUB_RUN_ID:-} -R ${GITHUB_REPOSITORY:-}}
 \`\`\`
 
 Inside the session run \`tailcat-debug-done\` to let the job continue (or \`tailcat-debug-fail\` to fail it).
