@@ -19,6 +19,7 @@ ARTIFACT_PREFIX="tailcat-address"
 DEFAULT_WORKFLOW="${TAILCAT_DEBUG_WORKFLOW:-debug.yml}"
 DEFAULT_KEY_INPUT="${TAILCAT_DEBUG_KEY_INPUT:-tailcat_client_key}"
 TC=""
+IDENTITY=""   # optional ssh -i key for sessions that also require an SSH key
 
 # ---------------------------------------------------------------- utilities
 
@@ -54,6 +55,10 @@ Usage:
           --keep              leave the session running after you disconnect
           --end               end the session after you disconnect (no prompt)
           --wait-timeout MIN  give up if no session appears (default: 20)
+      -i, --identity FILE     SSH private key to log in with, when the session
+                              also requires one of your GitHub SSH keys
+                              (debug.yml does by default; default: ssh's usual
+                              keys/agent)
 
   tailcat-debug attach <run-id|run-url> [options] [-- <remote command>]
       Connect to a running session (e.g. one started by an on-failure step).
@@ -63,10 +68,11 @@ Usage:
           --key FILE          tailcat client key to use (default: the run's
                               one-off key if this machine started it, else
                               ${CLIENT_KEY/#$HOME/\~})
+      -i, --identity FILE     as for run
           --keep / --end      as for run
           --wait-timeout MIN  how long to wait for the session (default: 20)
 
-  tailcat-debug end <run-id|run-url> [-R OWNER/REPO] [-j TEXT] [--key FILE]
+  tailcat-debug end <run-id|run-url> [-R OWNER/REPO] [-j TEXT] [--key FILE] [-i FILE]
       Let the job continue (same as running tailcat-debug-done in the session).
 
   tailcat-debug pubkey
@@ -288,11 +294,25 @@ fetch_address() {
   [[ "$ADDR" =~ ^tc[A-Za-z0-9_-]+$ ]] || die "artifact $ARTIFACT doesn't hold a tailcat address"
 }
 
+tc_ssh() {
+  local key="$1"; shift
+  local -a id=()
+  [[ -n "$IDENTITY" ]] && id=(-i "$IDENTITY")
+  "$TC" --key="$key" ssh ${id[@]+"${id[@]}"} "$ADDR" "$@"
+}
+
+ssh_hint() {
+  # ssh exits 255 for connection/auth errors (vs. the remote command's status).
+  (( $1 == 255 )) || return 0
+  warn "ssh failed. If the session requires your GitHub SSH key (debug.yml's default),"
+  warn "make sure ssh can use one listed at https://github.com/<you>.keys: ssh-add it, or pass -i <key>."
+}
+
 end_session() {
   local key="$1"
   info "Ending debug session; the job will continue"
   # shellcheck disable=SC2016 # $HOME expands on the runner
-  if "$TC" --key="$key" ssh "$ADDR" 'touch "$HOME/.tailcat-debug/continue"' </dev/null; then
+  if tc_ssh "$key" 'touch "$HOME/.tailcat-debug/continue"' </dev/null; then
     return 0
   fi
   warn "couldn't reach the session to end it; it ends at its timeout, or: gh run cancel $RUN_ID -R $REPO"
@@ -305,7 +325,8 @@ connect() {
   info "Connecting to runner (run $RUN_ID, $ARTIFACT)"
   note "In the session: tailcat-debug-done to let the job continue, tailcat-debug-fail to fail it."
   local rc=0
-  "$TC" --key="$key" ssh "$ADDR" "$@" || rc=$?
+  tc_ssh "$key" "$@" || rc=$?
+  ssh_hint "$rc"
   if [[ "$after" == ask ]]; then
     if is_tty && (( $# == 0 )); then
       local ans
@@ -331,6 +352,20 @@ cleanup_session_key() {
   return 0
 }
 
+# debug.yml also requires one of your GitHub SSH keys by default; catch a
+# missing key here rather than as a failed run a minute later.
+check_github_ssh_keys() {
+  local f me n
+  for f in "$@"; do [[ "$f" == github_ssh_key=false ]] && return 0; done
+  me=$(gh api user -q .login 2>/dev/null) || return 0
+  n=$(gh api "users/$me/keys" -q 'length' 2>/dev/null) || return 0
+  if [[ "$n" == 0 ]]; then
+    warn "your GitHub account ($me) has no SSH keys, so a session that requires one"
+    warn "(debug.yml's default) can't start. Add one with: gh ssh-key add ~/.ssh/id_ed25519.pub"
+    warn "or turn the second factor off with: -f github_ssh_key=false"
+  fi
+}
+
 # ----------------------------------------------------------------- commands
 
 cmd_run() {
@@ -350,6 +385,7 @@ cmd_run() {
       --keep) after=keep; shift ;;
       --end) after=end; shift ;;
       --wait-timeout) wait_min="${2:?}"; shift 2 ;;
+      -i|--identity) IDENTITY="${2:?}"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       --) shift; break ;;
       *) die "unknown option for run: $1 (see tailcat-debug help)" ;;
@@ -357,6 +393,8 @@ cmd_run() {
   done
   ensure_deps
   resolve_repo
+  [[ -z "$IDENTITY" || -f "$IDENTITY" ]] || die "no such SSH key file: $IDENTITY"
+  check_github_ssh_keys "${fields[@]+"${fields[@]}"}"
 
   # A one-off client key just for this session: the runner only accepts
   # WireGuard handshakes from it, so the published address alone is useless.
@@ -402,6 +440,7 @@ cmd_attach() {
       --keep) after=keep; shift ;;
       --end) after=end; shift ;;
       --wait-timeout) wait_min="${2:?}"; shift 2 ;;
+      -i|--identity) IDENTITY="${2:?}"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       --) shift; break ;;
       -*) die "unknown option for attach: $1" ;;
@@ -426,6 +465,7 @@ cmd_end() {
       -R|--repo) REPO="${2:?}"; shift 2 ;;
       -j|--job) job="${2:?}"; shift 2 ;;
       --key) key="${2:?}"; shift 2 ;;
+      -i|--identity) IDENTITY="${2:?}"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       -*) die "unknown option for end: $1" ;;
       *) [[ -z "$ref" ]] || die "unexpected argument: $1"; ref="$1"; shift ;;

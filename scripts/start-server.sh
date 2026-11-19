@@ -5,6 +5,7 @@
 # Env (set by action.yml):
 #   TC_ALLOW          comma-separated client node keys (nodekey:<hex>) allowed to connect
 #   TC_SSH_KEYS       optional --ssh-authorized-keys sources (e.g. "alice@github")
+#   TC_ALLOWED_ACTORS comma-separated GitHub users allowed to start a session ("*" = anyone)
 #   TC_INSECURE       "true" to allow an unauthenticated server (address == credential)
 #   TC_ARTIFACT_NAME  artifact name to publish the address under (optional)
 set -euo pipefail
@@ -13,6 +14,23 @@ state="${TC_STATE_DIR:-$HOME/.tailcat-debug}"
 mkdir -p "$state"
 chmod 700 "$state"
 rm -f "$state/address" "$state/continue" "$state/fail"
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Who may open a session at all. Checked against both the run's actor and the
+# user who triggered this attempt (a re-run), case-insensitively.
+# Empty (e.g. an unset repo variable) means the repo owner, never "anyone".
+actors="${TC_ALLOWED_ACTORS//[[:space:]]/}"
+actors="$(lower "${actors:-${GITHUB_REPOSITORY_OWNER:-}}")"
+[[ -n "$actors" ]] || { echo "::error::allowed-actors is empty and the repository owner is unknown"; exit 1; }
+if [[ "$actors" != "*" ]]; then
+  for who in "${GITHUB_ACTOR:-}" "${GITHUB_TRIGGERING_ACTOR:-${GITHUB_ACTOR:-}}"; do
+    if [[ ",$actors," != *",$(lower "$who"),"* ]]; then
+      echo "::error::'$who' is not in allowed-actors ($actors); not starting a debug session."
+      exit 1
+    fi
+  done
+fi
 
 allow="${TC_ALLOW:-}"
 allow="${allow//[[:space:]]/}"   # tolerate "key1, key2" and trailing newlines
@@ -126,8 +144,9 @@ printf '%s\n' "$addr" > "$pub_dir/address.txt"
 repo_run="${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}"
 if [[ -n "$allow" || -n "$ssh_keys" ]]; then
   # Access is enforced by key, so the address itself is not the credential.
+  # The address isn't the credential, but there's no need to put it in
+  # (possibly public) logs either; it's only in the artifact.
   echo "::notice title=tailcat debug session::Connect with: tailcat-debug attach ${GITHUB_RUN_ID:-<run-id>} -R ${GITHUB_REPOSITORY:-<repo>}"
-  echo "tailcat address: $addr"
 else
   echo "::warning title=tailcat debug session::Running WITHOUT authentication; the address artifact '$name' is the only credential."
 fi

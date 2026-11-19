@@ -58,6 +58,7 @@ jobs:
         uses: ./
         with:
           allow: ${{ steps.keys.outputs.good }}
+          allowed-actors: "*"   # fork PRs run this test too
           wait: "false"
 
       - name: Allowed key gets a shell with the job environment
@@ -89,3 +90,55 @@ jobs:
           addr=$(cat "${{ steps.session.outputs.address-file }}")
           ( sleep 5; tailcat --key="$RUNNER_TEMP/keys/good.private.json" ssh "$addr" 'touch ~/.tailcat-debug/continue' ) &
           TC_TIMEOUT_MINUTES=3 to 120 scripts/wait.sh
+
+  # Second factor: tunnel key AND an SSH key must both be right.
+  e2e-ssh-key:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/install-tailcat.sh
+      - name: Make keys
+        id: keys
+        run: |
+          k="$RUNNER_TEMP/keys"; mkdir -p "$k"
+          tailcat genkey --client --key="$k/tc.private.json" >/dev/null
+          ssh-keygen -q -t ed25519 -N "" -f "$k/good_ssh"
+          ssh-keygen -q -t ed25519 -N "" -f "$k/bad_ssh"
+          echo "tc=$(tailcat --key="$k/tc.private.json" printpub)" >> "$GITHUB_OUTPUT"
+          echo "ssh=$(cat "$k/good_ssh.pub")" >> "$GITHUB_OUTPUT"
+      - id: session
+        uses: ./
+        with:
+          allow: ${{ steps.keys.outputs.tc }}
+          ssh-authorized-keys: ${{ steps.keys.outputs.ssh }}
+          allowed-actors: "*"
+          wait: "false"
+      - name: Right tunnel key + right SSH key gets in
+        run: |
+          addr=$(cat "${{ steps.session.outputs.address-file }}")
+          k="$RUNNER_TEMP/keys"
+          out=$(timeout 60 tailcat --key="$k/tc.private.json" ssh -i "$k/good_ssh" "$addr" 'echo in')
+          [[ "$out" == in ]]
+      - name: Right tunnel key + wrong SSH key is refused
+        run: |
+          addr=$(cat "${{ steps.session.outputs.address-file }}")
+          k="$RUNNER_TEMP/keys"
+          if timeout 60 tailcat --key="$k/tc.private.json" ssh -i "$k/bad_ssh" "$addr" true </dev/null; then
+            echo "::error::wrong SSH key got in"; exit 1
+          fi
+
+  # Sessions refuse to start for actors not on allowed-actors.
+  actor-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Not-allowed actor is refused
+        env:
+          TC_ALLOW: nodekey:0000000000000000000000000000000000000000000000000000000000000000
+          TC_ALLOWED_ACTORS: someone-else,another-user
+        run: |
+          if out=$(scripts/start-server.sh 2>&1); then
+            echo "::error::session started for $GITHUB_ACTOR"; exit 1
+          fi
+          echo "$out" | grep -q "is not in allowed-actors"

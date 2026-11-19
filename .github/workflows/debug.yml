@@ -46,6 +46,11 @@ on:
         required: false
         type: boolean
         default: true
+      github_ssh_key:
+        description: Also require one of your GitHub account's SSH keys (second factor)
+        required: false
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       tailcat_client_key:
@@ -67,6 +72,10 @@ on:
         required: false
         type: boolean
         default: true
+      github_ssh_key:
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -82,4 +91,7 @@ jobs:
       - uses: Sniperlyf3/PipelineTests@main
         with:
           allow: ${{ inputs.tailcat_client_key }}
+          # Second factor: the SSH layer also wants a key from github.com/<you>.keys.
+          ssh-authorized-keys: ${{ inputs.github_ssh_key && format('{0}@github', github.actor) || '' }}
+          allowed-actors: ${{ github.repository_owner }}
           timeout-minutes: ${{ inputs.timeout_minutes || '30' }}

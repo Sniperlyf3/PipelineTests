@@ -23,6 +23,14 @@ inputs:
       When set, the server requires one of these SSH keys too.
     required: false
     default: ""
+  allowed-actors:
+    description: >
+      Comma-separated GitHub usernames allowed to start a session. Both the
+      run's actor and (for re-runs) the user who triggered the attempt must be
+      listed, so e.g. a failure() step on a fork's pull request won't open one.
+      Defaults to the repository owner. "*" allows anyone who can run the job.
+    required: false
+    default: ${{ github.repository_owner }}
   insecure-no-auth:
     description: >
       Allow starting the server with neither 'allow' nor 'ssh-authorized-keys'.
@@ -76,6 +84,7 @@ runs:
       env:
         TC_ALLOW: ${{ inputs.allow }}
         TC_SSH_KEYS: ${{ inputs.ssh-authorized-keys }}
+        TC_ALLOWED_ACTORS: ${{ inputs.allowed-actors }}
         TC_INSECURE: ${{ inputs.insecure-no-auth }}
         TC_ARTIFACT_NAME: ${{ inputs.artifact-name }}
       run: '"$GITHUB_ACTION_PATH/scripts/start-server.sh"'

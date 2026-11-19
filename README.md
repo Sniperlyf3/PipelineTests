@@ -18,22 +18,61 @@ your machine                                         GitHub-hosted runner
 ────────────                                         ────────────────────
 tailcat-debug run
  ├─ tailcat genkey --client  → one-off client key (private part never leaves your machine)
- ├─ gh workflow run debug.yml -f tailcat_client_key=nodekey:…  ─────►  tailcat serve --allow=nodekey:… no-auth-ssh
+ ├─ gh workflow run debug.yml -f tailcat_client_key=nodekey:…  ─────►  tailcat serve --allow=nodekey:…
+ │                                                                     │    --ssh-authorized-keys=<you>@github ssh
  │                                                                     │  (fresh ephemeral server key)
  ├─ polls the run for the "tailcat-address-*" artifact  ◄──────────────┘  uploads its address as an artifact
  └─ tailcat --key=<one-off> ssh <address>   ═══ WireGuard (direct, or via DERP) ═══►  shell in $GITHUB_WORKSPACE
+    (+ your normal SSH key)
 ```
 
 - **Keys.** Each session uses a fresh server key on the runner and a fresh client key
-  on your machine. The runner passes `--allow` so it only accepts WireGuard handshakes
-  from your client key. Anyone else's packets are dropped before SSH sees them. That's
-  why the address can be published as a workflow artifact: without your private key
-  it gets nobody in.
+  on your machine. See [Security](#security-public-repos) for why only you can get in.
 - **The shell looks like a step.** The session starts in `$GITHUB_WORKSPACE` with the
   job's environment: `PATH`, `GITHUB_*`, and whatever the earlier steps exported.
 - **Ending the session.** Run `tailcat-debug-done` inside the session to let the job
   continue, or `tailcat-debug-fail` to fail it. When you disconnect, the helper asks
   whether to end the session. If you do nothing, it ends at `timeout-minutes` (default 30).
+
+## Security (public repos)
+
+This repo is public, so its workflow runs, logs and artifacts are public too. A
+session is still only reachable by you, because four separate checks all have to pass:
+
+1. **Only you can start one.** `workflow_dispatch` needs write access to the repo.
+   The action also refuses to start unless the run's actor, and the user who
+   triggered a re-run, are in `allowed-actors`, which defaults to the repo owner.
+   So a fork's pull request can't open a session, even through a `failure()` step.
+2. **Tunnel layer: your one-off WireGuard key.** The runner runs
+   `tailcat serve --allow=<your public key>`. tailcat drops handshakes from any other
+   key before they reach SSH, so a stranger can't even tell a server is there. The
+   private half is created on your machine for this one session and never leaves it.
+   The workflow input holds only the public key.
+3. **SSH layer: your GitHub SSH key.** `debug.yml` also passes
+   `--ssh-authorized-keys=<you>@github`. Getting past the tunnel still needs the
+   private half of one of the keys at `https://github.com/<you>.keys`. Turn this off
+   with `-f github_ssh_key=false`.
+4. **Sessions are short-lived.** The server key is ephemeral, the session ends at
+   `tailcat-debug-done` or the timeout, and the runner is destroyed after the job.
+   The address artifact is kept for 1 day and is never printed to the log.
+
+So what's public? The run itself, your public tailcat key (an input), and the address
+artifact, which signed-in GitHub users can download. None of these get anyone in.
+Knowing the address only lets someone send packets that the runner throws away. The
+address also contains a WireGuard pre-shared key, and that key is public now. That only
+removes tailcat's extra post-quantum layer, so the tunnel is still standard WireGuard
+(Curve25519). This is the same assumption Tailscale's own connections rely on.
+
+Things to keep in mind:
+
+- Anything in the job is reachable from the shell. That includes files, the checked-out
+  code, and any secrets you wrote to disk or `$GITHUB_ENV` earlier in the job. Only
+  that job's runner is exposed, and only to you.
+- The steps never use `insecure-no-auth: true`. In a public repo it would give a shell
+  to anyone who downloads the artifact.
+- Under Settings → Actions → General, keep "Require approval for all external
+  contributors" (or at least first-time contributors) for fork pull requests. That's
+  good practice for any public repo with Actions.
 
 ## Install the helper
 
@@ -59,6 +98,7 @@ tailcat-debug run -R Sniperlyf3/PipelineTests -- uname -a           # run one co
 ```
 
 `run` options: `-w/--workflow`, `-r/--ref`, `-f key=value` (extra workflow inputs),
+`-i/--identity` (the SSH key to use for the second factor),
 `--keep`/`--end` (what to do after you disconnect), `--wait-timeout`. See
 `tailcat-debug help`.
 
@@ -89,6 +129,7 @@ jobs:
         if: inputs.tailcat_client_key != ''
         with:
           allow: ${{ inputs.tailcat_client_key }}
+          ssh-authorized-keys: ${{ github.actor }}@github   # optional second factor
 
       - run: make test
 ```
@@ -121,6 +162,9 @@ listed, comma-separated. It's a public key, so it doesn't need to be a secret.
         if: failure()
         with:
           allow: ${{ vars.TAILCAT_ALLOW }}
+          ssh-authorized-keys: ${{ github.repository_owner }}@github   # optional second factor
+          # allowed-actors defaults to the repo owner, so failing runs from forks
+          # or other users don't open a session.
 ```
 
 Then connect to the run:
@@ -140,6 +184,7 @@ can pick with `--job <text>`.
 |---|---|---|
 | `allow` | | Comma-separated client public keys (`nodekey:…`) allowed to connect. |
 | `ssh-authorized-keys` | | Optional second factor at the SSH layer, e.g. `${{ github.actor }}@github` (fetches the actor's GitHub SSH keys). If set, the session uses tailcat's `ssh` service instead of `no-auth-ssh`. |
+| `allowed-actors` | repo owner | GitHub users allowed to start a session (actor and re-run triggerer must both be listed). Empty means the repo owner. `*` means anyone who can run the job. |
 | `insecure-no-auth` | `false` | Start even with neither of the above. Then anyone who can read the repo's artifacts gets a shell. |
 | `wait` | `true` | Block until `tailcat-debug-done`, the timeout, or server exit. With `false` the server runs in the background for the rest of the job. |
 | `timeout-minutes` | `30` | Maximum session length when `wait` is true. |
