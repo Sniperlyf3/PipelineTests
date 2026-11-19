@@ -26,7 +26,10 @@ jobs:
             bin/tailcat-debug > dist/tailcat-debug
           chmod +x dist/tailcat-debug
           grep -q "^TAILCAT_DEBUG_VERSION=\"${GITHUB_REF_NAME}\"$" dist/tailcat-debug
-          (cd dist && sha256sum tailcat-debug > SHA256SUMS)
+          sed "s/^\$TailcatDebugVersion = 'dev'$/\$TailcatDebugVersion = '${GITHUB_REF_NAME}'/" \
+            bin/tailcat-debug.ps1 > dist/tailcat-debug.ps1
+          grep -q "^\$TailcatDebugVersion = '${GITHUB_REF_NAME}'$" dist/tailcat-debug.ps1
+          (cd dist && sha256sum tailcat-debug tailcat-debug.ps1 > SHA256SUMS)
 
       - name: Create release
         env:
@@ -34,7 +37,7 @@ jobs:
         run: |
           prerelease=()
           [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease=(--prerelease)
-          gh release create "$GITHUB_REF_NAME" dist/tailcat-debug dist/SHA256SUMS \
+          gh release create "$GITHUB_REF_NAME" dist/tailcat-debug dist/tailcat-debug.ps1 dist/SHA256SUMS \
             --title "$GITHUB_REF_NAME" --generate-notes "${prerelease[@]}"
 
       - name: Move major version tag

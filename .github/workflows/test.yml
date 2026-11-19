@@ -142,3 +142,74 @@ jobs:
             echo "::error::session started for $GITHUB_ACTOR"; exit 1
           fi
           echo "$out" | grep -q "is not in allowed-actors"
+
+  # The Windows helper, under PowerShell 7 and Windows PowerShell 5.1: parse,
+  # analyze, then a real session through its own functions (download tailcat,
+  # one-off key, tailcat ssh via the ProxyCommand), and check that nothing is
+  # left on disk afterwards.
+  windows-helper:
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [pwsh, powershell]
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse
+        run: |
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\bin\tailcat-debug.ps1", [ref]$null, [ref]$errs)
+          if ($errs) { $errs | Format-List | Out-String | Write-Host; exit 1 }
+
+      - name: PSScriptAnalyzer
+        if: matrix.shell == 'pwsh'
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path bin\tailcat-debug.ps1 -Severity Error
+          $r | Format-Table -AutoSize | Out-String | Write-Host
+          if ($r) { exit 1 }
+
+      - name: Session through the helper's functions leaves no files
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\bin\tailcat-debug.ps1          # dot-sourced: loads functions only
+          $tcCache = Join-Path $env:LOCALAPPDATA 'tailcat'
+          if (Test-Path $tcCache) { Remove-Item -Recurse -Force $tcCache }
+
+          New-WorkDir
+          Install-Tailcat
+          $work = $State.Work
+          $key = Join-Path $work 'client.private.json'
+          $pub = New-ClientKey $key
+
+          # A server on this runner that only allows that key. Keep its own
+          # cache out of %LOCALAPPDATA% so the leftover check below is about the client.
+          $addrFile = Join-Path $env:RUNNER_TEMP 'addr.txt'
+          $env:TAILCAT_ADDR_FILE = $addrFile
+          $savedLocal = $env:LOCALAPPDATA
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'srvcache'
+          $srv = Start-Process -FilePath $State.Tc -PassThru -NoNewWindow `
+            -ArgumentList @('--key=new', 'serve', "--allow=$pub", 'no-auth-ssh') `
+            -RedirectStandardError (Join-Path $env:RUNNER_TEMP 'srv.log')
+          $env:LOCALAPPDATA = $savedLocal
+          Remove-Item Env:\TAILCAT_ADDR_FILE
+          for ($i = 0; $i -lt 60 -and -not (Test-Path $addrFile); $i++) { Start-Sleep -Milliseconds 500 }
+          $State.Addr = (Get-Content -Raw $addrFile).Trim()
+
+          $out = (Invoke-Tailcat @("--key=$key", 'ssh', $State.Addr, 'echo hello-from-tailcat') | Out-String).Trim()
+          Write-Host "remote said: $out"
+          if ($out -notmatch 'hello-from-tailcat') { throw "unexpected ssh output: $out" }
+
+          # No run to end; just clean up like the helper does on exit.
+          Stop-DebugSession $key
+          if (Test-Path $work) { throw "work folder left behind: $work" }
+          if (Test-Path $tcCache) { throw "tailcat wrote to $tcCache" }
+          if (-not $srv.HasExited) { throw 'server (started from the work folder) still running' }
+          Write-Host 'no files left behind'

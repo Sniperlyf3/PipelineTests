@@ -87,6 +87,37 @@ the repo) and `ssh`. If `tailcat` is missing, the helper offers to install it: L
 gets the checksum-verified release binary, macOS gets `brew install tailcat`. It runs on
 Linux, macOS (it's written to work with the stock bash 3.2), and Git Bash or WSL on Windows.
 
+### Windows one-liner (nothing installed, nothing left behind)
+
+Paste this into PowerShell. It runs the Windows helper straight from the release,
+without saving the script. The helper starts the debug workflow, connects you to the
+runner, and cleans up when you exit the shell:
+
+```powershell
+& ([scriptblock]::Create((New-Object Net.WebClient).DownloadString('https://github.com/Sniperlyf3/PipelineTests/releases/latest/download/tailcat-debug.ps1'))) -Repo Sniperlyf3/PipelineTests
+```
+
+- **What it does:** downloads tailcat into one temp folder and checks its checksum. It
+  creates the one-off key there, starts the workflow, waits for the runner, and opens
+  the SSH session.
+- **What happens when you exit** (or press Ctrl+C at any point): it ends the session so
+  the job continues. If you never got connected, it cancels the run instead. Then it
+  deletes the temp folder. tailcat's cache is redirected into that folder, and ssh's
+  `known_hosts` goes to `NUL`, so nothing of this tool's is left on disk. PowerShell's
+  own history still records the command you typed.
+- **Requirements:**
+  - [`gh`](https://cli.github.com), logged in: `winget install GitHub.cli`, then
+    `gh auth login`.
+  - The built-in Windows OpenSSH client.
+  - Windows PowerShell 5.1 or PowerShell 7.
+- **Options:** add them after `-Repo …`, for example `-RunsOn windows-latest`,
+  `-Timeout 60`, `-Ref my-branch`, `-Workflow ci.yml`, or `-Identity $HOME\.ssh\id_ed25519`.
+  Use `-NoGitHubSshKey` if your GitHub account has no SSH key, or `-- uname -a` to run
+  one command instead of a shell.
+- **Saved key not used:** each session gets a brand-new key that's deleted afterwards,
+  so the long-lived key from `tailcat-debug pubkey` isn't used. Use the bash helper for
+  `attach` to sessions opened by `failure()` steps.
+
 ## Usage
 
 ### Debug on a fresh runner
@@ -200,7 +231,7 @@ described above doesn't apply.
 ## Releasing
 
 Push a tag like `v1.0.0`. The [release workflow](.github/workflows/release.yml)
-publishes a release with `tailcat-debug` (version stamped in) and `SHA256SUMS`
+publishes a release with `tailcat-debug`, `tailcat-debug.ps1` (versions stamped in) and `SHA256SUMS`
 attached, and moves the `v1` tag.
 
 ## Repo layout
@@ -211,6 +242,7 @@ scripts/install-tailcat.sh   installs tailcat on the runner (checksum-verified)
 scripts/start-server.sh      starts tailcat serve --allow=… in the background
 scripts/wait.sh              keeps the job alive until done/timeout
 bin/tailcat-debug            the helper you run locally (shipped in Releases)
+bin/tailcat-debug.ps1        Windows helper for the PowerShell one-liner (shipped in Releases)
 .github/workflows/debug.yml  dispatchable/reusable "give me a runner" workflow
 .github/workflows/test.yml   lint and a real end-to-end session test on Linux + macOS
 .github/workflows/release.yml
