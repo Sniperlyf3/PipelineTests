@@ -19,7 +19,7 @@ inputs:
   ssh-authorized-keys:
     description: >
       Optional extra SSH-layer auth: --ssh-authorized-keys sources, e.g.
-      "${{ github.actor }}@github" or a literal "ssh-ed25519 AAAA..." line.
+      "<your-github-username>@github" or a literal "ssh-ed25519 AAAA..." line.
       When set, the server requires one of these SSH keys too.
     required: false
     default: ""
